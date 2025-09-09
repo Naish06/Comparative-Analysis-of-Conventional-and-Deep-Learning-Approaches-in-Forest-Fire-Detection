@@ -1,0 +1,297 @@
+# Install required libraries
+!pip install scikit-image
+!pip install numpy
+!pip install scikit-learn
+!pip install matplotlib
+!pip install seaborn
+!pip install tensorflow
+
+# Import necessary libraries
+from google.colab import drive
+import os
+from skimage.io import imread
+from skimage.transform import resize
+from skimage.color import rgba2rgb
+import numpy as np
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
+from tensorflow.keras.models import Model
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Mount Google Drive to access the dataset
+drive.mount('/content/drive')
+
+# Define the base directory for the dataset
+base_dir = '/content/drive/MyDrive/forestfire/'
+
+# Function to load and resize images to RGB [0,255] float32, assign labels
+def load_resize_images(folder_path, label):
+    """
+    Loads images from a folder in RGB, handles RGBA by converting to RGB,
+    resizes to 224x224, converts to [0,255] float32,
+    and assigns the given label. Skips images with incorrect shapes.
+    """
+    images = []
+    labels = []
+    expected_shape = (224, 224, 3)  # Expected shape for ResNet50
+    for filename in os.listdir(folder_path):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):  # Support common image formats
+            img_path = os.path.join(folder_path, filename)
+            try:
+                img = imread(img_path)  # Load image
+                # Handle RGBA images (4 channels) by converting to RGB
+                if len(img.shape) == 3 and img.shape[-1] == 4:
+                    img = rgba2rgb(img)  # Convert RGBA to RGB
+                # If grayscale, convert to RGB by repeating channels
+                if len(img.shape) == 2:
+                    img = np.stack((img,)*3, axis=-1)
+                # Resize to 224x224
+                resized = resize(img, (224, 224), anti_aliasing=True)
+                # Ensure the output is 3D (224x224x3)
+                if resized.shape != expected_shape:
+                    print(f"Skipping {img_path}: Expected shape {expected_shape}, got {resized.shape}")
+                    continue
+                # Convert to [0,255] float32
+                resized = (resized * 255).astype(np.float32) if np.max(resized) <= 1 else resized.astype(np.float32)
+                images.append(resized)
+                labels.append(label)
+            except Exception as e:
+                print(f"Error loading {img_path}: {e}")
+    print(f"Loaded {len(images)} images from {folder_path}")
+    return images, labels
+
+# Load and resize training data
+train_fire_dir = os.path.join(base_dir, 'train/fire')
+train_nofire_dir = os.path.join(base_dir, 'train/nofire')
+train_fire_images, train_fire_labels = load_resize_images(train_fire_dir, 1)  # 1 for fire
+train_nofire_images, train_nofire_labels = load_resize_images(train_nofire_dir, 0)  # 0 for nofire
+
+# Combine training data
+train_images = train_fire_images + train_nofire_images
+train_labels = train_fire_labels + train_nofire_labels
+
+# Verify shapes before converting to NumPy array
+print("Verifying training image shapes...")
+expected_shape = (224, 224, 3)
+for i, img in enumerate(train_images):
+    if img.shape != expected_shape:
+        print(f"Invalid shape at index {i}: {img.shape}")
+        raise ValueError(f"Image at index {i} has incorrect shape: {img.shape}")
+
+# Convert to NumPy arrays
+try:
+    X_train_rgb = np.array(train_images)
+    y_train = np.array(train_labels)
+    print(f"Training RGB data shape: {X_train_rgb.shape}")
+except Exception as e:
+    print(f"Error creating training array: {e}")
+    raise
+
+# Preprocess for ResNet50
+X_train_preprocessed = preprocess_input(X_train_rgb.copy())  # Copy to avoid modifying original
+
+# Load and resize test data
+test_fire_dir = os.path.join(base_dir, 'test/fire')
+test_nofire_dir = os.path.join(base_dir, 'test/nofire')
+test_fire_images, test_fire_labels = load_resize_images(test_fire_dir, 1)
+test_nofire_images, test_nofire_labels = load_resize_images(test_nofire_dir, 0)
+
+# Combine test data
+test_images = test_fire_images + test_nofire_images
+test_labels = test_fire_labels + test_nofire_labels
+
+# Verify shapes before converting to NumPy array
+print("Verifying test image shapes...")
+for i, img in enumerate(test_images):
+    if img.shape != expected_shape:
+        print(f"Invalid shape at index {i}: {img.shape}")
+        raise ValueError(f"Image at index {i} has incorrect shape: {img.shape}")
+
+# Convert to NumPy arrays
+try:
+    X_test_rgb = np.array(test_images)
+    y_test = np.array(test_labels)
+    print(f"Test RGB data shape: {X_test_rgb.shape}")
+except Exception as e:
+    print(f"Error creating test array: {e}")
+    raise
+
+# Preprocess for ResNet50 (clean test)
+X_test_preprocessed = preprocess_input(X_test_rgb.copy())
+
+# Function to add Gaussian noise
+def add_gaussian_noise(images_rgb, mean=0, std=25):
+    """
+    Adds Gaussian noise to RGB images in [0,255] range.
+    Clips the result to [0,255].
+    """
+    noise = np.random.normal(mean, std, images_rgb.shape)
+    noisy_images = images_rgb + noise
+    noisy_images = np.clip(noisy_images, 0, 255)
+    return noisy_images
+
+# Create noisy test images
+X_test_noisy_rgb = add_gaussian_noise(X_test_rgb.copy())
+X_test_noisy_preprocessed = preprocess_input(X_test_noisy_rgb)
+
+# Check class balance in training and test sets
+print("Training set class balance:")
+print(f"Fire: {len(train_fire_labels)}, NoFire: {len(train_nofire_labels)}")
+print("Test set class balance:")
+print(f"Fire: {len(test_fire_labels)}, NoFire: {len(test_nofire_labels)}")
+
+# Load pre-trained ResNet50 model for feature extraction
+base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+
+# Function to extract ResNet50 features
+def extract_resnet50_features(preprocessed_images):
+    """
+    Extracts features from preprocessed RGB images using ResNet50.
+    Applies global average pooling to get a 1D feature vector (2048-dimensional).
+    """
+    # Predict features (output shape: (num_images, 7, 7, 2048))
+    features = base_model.predict(preprocessed_images, batch_size=32)
+    # Global average pooling to flatten to (num_images, 2048)
+    pooled_features = np.mean(features, axis=(1, 2))
+    return pooled_features
+
+# Extract ResNet50 features for training and clean test sets
+X_train = extract_resnet50_features(X_train_preprocessed)
+X_test = extract_resnet50_features(X_test_preprocessed)
+
+# Train Random Forest Classifier on extracted features
+clf = RandomForestClassifier(random_state=42)
+clf.fit(X_train, y_train)
+
+# Predict on clean test set
+y_pred = clf.predict(X_test)
+y_prob = clf.predict_proba(X_test)[:, 1]  # Probabilities for ROC-AUC
+
+# Evaluation Metrics for clean test
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred)
+
+print("\nEvaluation Metrics on Clean Test Set:")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1-Score: {f1:.4f}")
+
+# Confusion Matrix and Visualization for clean
+cm = confusion_matrix(y_test, y_pred)
+print("\nConfusion Matrix (Clean):")
+print(cm)
+
+plt.figure(figsize=(6, 4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['NoFire', 'Fire'], yticklabels=['NoFire', 'Fire'])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix (Clean)')
+plt.show()
+
+# ROC-AUC Curve for clean
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6, 4))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC-AUC Curve (Clean)')
+plt.legend(loc='lower right')
+plt.show()
+
+print(f"ROC-AUC (Clean): {roc_auc:.4f}")
+
+# Class-wise Error Analysis for clean
+print("\nClass-wise Error Analysis (Clean):")
+nofire_misclassified_as_fire = cm[0, 1]  # False Positives (NoFire -> Fire)
+fire_misclassified_as_nofire = cm[1, 0]  # False Negatives (Fire -> NoFire)
+print(f"NoFire misclassified as Fire: {nofire_misclassified_as_fire} ({nofire_misclassified_as_fire / len(test_nofire_labels):.2%} of NoFire class)")
+print(f"Fire misclassified as NoFire: {fire_misclassified_as_nofire} ({fire_misclassified_as_nofire / len(test_fire_labels):.2%} of Fire class)")
+
+# Fairness Metrics for clean
+tn, fp = cm[0, 0], cm[0, 1]
+fn, tp = cm[1, 0], cm[1, 1]
+
+fpr_clean = fp / (fp + tn) if (fp + tn) > 0 else 0  # False Positive Rate (NoFire class)
+fnr_clean = fn / (fn + tp) if (fn + tp) > 0 else 0  # False Negative Rate (Fire class)
+
+print("\nFairness Metrics (Error Rate Balance) (Clean):")
+print(f"False Positive Rate (NoFire class): {fpr_clean:.4f}")
+print(f"False Negative Rate (Fire class): {fnr_clean:.4f}")
+print("Note: In a fair model, FPR and FNR should be similar if classes are treated equally. If classes are unbalanced, consider rebalancing techniques.")
+
+# Now extract features for noisy test
+X_test_noisy = extract_resnet50_features(X_test_noisy_preprocessed)
+
+# Predict on noisy test set
+y_pred_noisy = clf.predict(X_test_noisy)
+y_prob_noisy = clf.predict_proba(X_test_noisy)[:, 1]  # Probabilities for ROC-AUC
+
+# Evaluation Metrics for noisy test
+accuracy_noisy = accuracy_score(y_test, y_pred_noisy)
+precision_noisy = precision_score(y_test, y_pred_noisy)
+recall_noisy = recall_score(y_test, y_pred_noisy)
+f1_noisy = f1_score(y_test, y_pred_noisy)
+
+print("\nEvaluation Metrics on Noisy Test Set:")
+print(f"Accuracy: {accuracy_noisy:.4f}")
+print(f"Precision: {precision_noisy:.4f}")
+print(f"Recall: {recall_noisy:.4f}")
+print(f"F1-Score: {f1_noisy:.4f}")
+
+# Confusion Matrix and Visualization for noisy
+cm_noisy = confusion_matrix(y_test, y_pred_noisy)
+print("\nConfusion Matrix (Noisy):")
+print(cm_noisy)
+
+plt.figure(figsize=(6, 4))
+sns.heatmap(cm_noisy, annot=True, fmt='d', cmap='Blues', xticklabels=['NoFire', 'Fire'], yticklabels=['NoFire', 'Fire'])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix (Noisy)')
+plt.show()
+
+# ROC-AUC Curve for noisy
+fpr_noisy, tpr_noisy, _ = roc_curve(y_test, y_prob_noisy)
+roc_auc_noisy = auc(fpr_noisy, tpr_noisy)
+
+plt.figure(figsize=(6, 4))
+plt.plot(fpr_noisy, tpr_noisy, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc_noisy:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC-AUC Curve (Noisy)')
+plt.legend(loc='lower right')
+plt.show()
+
+print(f"ROC-AUC (Noisy): {roc_auc_noisy:.4f}")
+
+# Class-wise Error Analysis for noisy
+print("\nClass-wise Error Analysis (Noisy):")
+nofire_misclassified_as_fire_noisy = cm_noisy[0, 1]  # False Positives (NoFire -> Fire)
+fire_misclassified_as_nofire_noisy = cm_noisy[1, 0]  # False Negatives (Fire -> NoFire)
+print(f"NoFire misclassified as Fire: {nofire_misclassified_as_fire_noisy} ({nofire_misclassified_as_fire_noisy / len(test_nofire_labels):.2%} of NoFire class)")
+print(f"Fire misclassified as NoFire: {fire_misclassified_as_nofire_noisy} ({fire_misclassified_as_nofire_noisy / len(test_fire_labels):.2%} of Fire class)")
+
+# Fairness Metrics for noisy
+tn_noisy, fp_noisy = cm_noisy[0, 0], cm_noisy[0, 1]
+fn_noisy, tp_noisy = cm_noisy[1, 0], cm_noisy[1, 1]
+
+fpr_noisy = fp_noisy / (fp_noisy + tn_noisy) if (fp_noisy + tn_noisy) > 0 else 0  # False Positive Rate (NoFire class)
+fnr_noisy = fn_noisy / (fn_noisy + tp_noisy) if (fn_noisy + tp_noisy) > 0 else 0  # False Negative Rate (Fire class)
+
+print("\nFairness Metrics (Error Rate Balance) (Noisy):")
+print(f"False Positive Rate (NoFire class): {fpr_noisy:.4f}")
+print(f"False Negative Rate (Fire class): {fnr_noisy:.4f}")
+print("Note: In a fair model, FPR and FNR should be similar if classes are treated equally. If classes are unbalanced, consider rebalancing techniques.")
