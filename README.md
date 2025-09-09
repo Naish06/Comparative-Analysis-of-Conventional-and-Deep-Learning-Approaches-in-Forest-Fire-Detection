@@ -1,7 +1,7 @@
 # Comparative-Analysis-of-Conventional-and-Deep-Learning-Approaches-in-Forest-Fire-Detection
 ## Forest Fire Detection using Machine Learning and Deep Learning
 
-This repository contains an academic assignment on **forest fire image classification**.  
+This repository contains an comparative experimentation on **forest fire image classification**.  
 The project explores **traditional feature extraction + Random Forest** classifiers, a **novel hybrid approach**, and a **deep learning pipeline (ResNet50 + Random Forest)**.  
 The aim is to compare models in terms of accuracy, robustness, error tendencies, and fairness metrics.
 
