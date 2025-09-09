@@ -1,0 +1,1 @@
+# Comparative-Analysis-of-Conventional-and-Deep-Learning-Approaches-in-Forest-Fire-Detection
