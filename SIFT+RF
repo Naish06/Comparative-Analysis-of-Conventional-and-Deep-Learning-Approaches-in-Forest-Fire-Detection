@@ -1,0 +1,225 @@
+# Install required libraries
+!pip install scikit-image
+!pip install numpy
+!pip install scikit-learn
+!pip install matplotlib
+!pip install seaborn
+!pip install opencv-python
+
+# Import necessary libraries
+from google.colab import drive
+import os
+from skimage.io import imread
+from skimage.transform import resize
+from skimage.color import rgb2gray, rgba2rgb
+import cv2
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Mount Google Drive to access the dataset
+drive.mount('/content/drive')
+
+# Define the base directory for the dataset
+base_dir = '/content/drive/MyDrive/ShiDh/DL/NEW/forestfire/'
+
+# Function to load, preprocess images, and assign labels
+def load_preprocess_images(folder_path, label):
+    """
+    Loads images from a folder, handles RGBA images by converting to RGB,
+    converts to grayscale, resizes to 128x128, normalizes pixel values to [0,1],
+    and assigns the given label. Skips images with incorrect shapes.
+    Also returns original grayscale images for SIFT (8-bit).
+    """
+    images = []
+    images_8bit = []  # For SIFT processing
+    labels = []
+    expected_shape = (128, 128)  # Expected shape after preprocessing
+    for filename in os.listdir(folder_path):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):  # Support common image formats
+            img_path = os.path.join(folder_path, filename)
+            try:
+                img = imread(img_path)  # Load image
+                # Handle RGBA images (4 channels) by converting to RGB
+                if img.shape[-1] == 4:
+                    img = rgba2rgb(img)  # Convert RGBA to RGB
+                # Handle grayscale images (already single-channel)
+                if len(img.shape) == 2:
+                    gray = img
+                else:
+                    gray = rgb2gray(img)  # Convert to grayscale
+                # Resize to 128x128
+                resized = resize(gray, expected_shape, anti_aliasing=True)
+                # Ensure the output is 2D (128x128)
+                if resized.shape != expected_shape:
+                    print(f"Skipping {img_path}: Expected shape {expected_shape}, got {resized.shape}")
+                    continue
+                # Normalize to [0,1]
+                normalized = resized / np.max(resized) if np.max(resized) > 0 else resized
+                # Convert to 8-bit grayscale for SIFT (values in [0, 255])
+                gray_8bit = (resized * 255).astype(np.uint8)
+                images.append(normalized)
+                images_8bit.append(gray_8bit)
+                labels.append(label)
+            except Exception as e:
+                print(f"Error loading {img_path}: {e}")
+    print(f"Loaded {len(images)} images from {folder_path}")
+    return images, images_8bit, labels
+
+# Load and preprocess training data
+train_fire_dir = os.path.join(base_dir, 'train/fire')
+train_nofire_dir = os.path.join(base_dir, 'train/nofire')
+train_fire_images, train_fire_images_8bit, train_fire_labels = load_preprocess_images(train_fire_dir, 1)  # 1 for fire
+train_nofire_images, train_nofire_images_8bit, train_nofire_labels = load_preprocess_images(train_nofire_dir, 0)  # 0 for nofire
+
+# Combine training data
+train_images = train_fire_images + train_nofire_images
+train_images_8bit = train_fire_images_8bit + train_nofire_images_8bit
+train_labels = train_fire_labels + train_nofire_labels
+
+# Verify shapes before converting to NumPy array
+print("Verifying training image shapes...")
+for i, img in enumerate(train_images):
+    if img.shape != (128, 128):
+        print(f"Invalid shape at index {i}: {img.shape}")
+        raise ValueError(f"Image at index {i} has incorrect shape: {img.shape}")
+
+# Convert to NumPy arrays
+try:
+    X_train_raw = np.array(train_images)
+    X_train_8bit = np.array(train_images_8bit)
+    y_train = np.array(train_labels)
+    print(f"Training data shape: {X_train_raw.shape}")
+except Exception as e:
+    print(f"Error creating training array: {e}")
+    raise
+
+# Load and preprocess test data
+test_fire_dir = os.path.join(base_dir, 'test/fire')
+test_nofire_dir = os.path.join(base_dir, 'test/nofire')
+test_fire_images, test_fire_images_8bit, test_fire_labels = load_preprocess_images(test_fire_dir, 1)
+test_nofire_images, test_nofire_images_8bit, test_nofire_labels = load_preprocess_images(test_nofire_dir, 0)
+
+# Combine test data
+test_images = test_fire_images + test_nofire_images
+test_images_8bit = test_fire_images_8bit + test_nofire_images_8bit
+test_labels = test_fire_labels + test_nofire_labels
+
+# Verify shapes before converting to NumPy array
+print("Verifying test image shapes...")
+for i, img in enumerate(test_images):
+    if img.shape != (128, 128):
+        print(f"Invalid shape at index {i}: {img.shape}")
+        raise ValueError(f"Image at index {i} has incorrect shape: {img.shape}")
+
+# Convert to NumPy arrays
+try:
+    X_test_raw = np.array(test_images)
+    X_test_8bit = np.array(test_images_8bit)
+    y_test = np.array(test_labels)
+    print(f"Test data shape: {X_test_raw.shape}")
+except Exception as e:
+    print(f"Error creating test array: {e}")
+    raise
+
+# Check class balance in training and test sets
+print("Training set class balance:")
+print(f"Fire: {len(train_fire_labels)}, NoFire: {len(train_nofire_labels)}")
+print("Test set class balance:")
+print(f"Fire: {len(test_fire_labels)}, NoFire: {len(test_nofire_labels)}")
+
+# Function to extract SIFT features
+def extract_sift_features(images_8bit):
+    """
+    Extracts SIFT features from a list of 8-bit grayscale images.
+    Averages the descriptors to produce a fixed-length feature vector (128-dimensional).
+    Returns a zero vector if no keypoints are detected.
+    """
+    sift = cv2.SIFT_create()  # Initialize SIFT detector
+    sift_features = []
+    for img in images_8bit:
+        keypoints, descriptors = sift.detectAndCompute(img, None)
+        if descriptors is not None and len(descriptors) > 0:
+            # Average the descriptors to get a fixed-length feature vector
+            feature = np.mean(descriptors, axis=0)
+        else:
+            # If no keypoints are detected, use a zero vector
+            feature = np.zeros(128)  # SIFT descriptors are 128-dimensional
+            print(f"No SIFT keypoints detected for an image")
+        sift_features.append(feature)
+    return np.array(sift_features)
+
+# Extract SIFT features for training and test sets
+X_train = extract_sift_features(X_train_8bit)
+X_test = extract_sift_features(X_test_8bit)
+
+# Train Random Forest Classifier
+clf = RandomForestClassifier(random_state=42)
+clf.fit(X_train, y_train)
+
+# Predict on test set
+y_pred = clf.predict(X_test)
+y_prob = clf.predict_proba(X_test)[:, 1]  # Probabilities for ROC-AUC
+
+# Evaluation Metrics
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred)
+
+print("\nEvaluation Metrics on Test Set:")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1-Score: {f1:.4f}")
+
+# Confusion Matrix and Visualization
+cm = confusion_matrix(y_test, y_pred)
+print("\nConfusion Matrix:")
+print(cm)
+
+plt.figure(figsize=(6, 4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['NoFire', 'Fire'], yticklabels=['NoFire', 'Fire'])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.show()
+
+# ROC-AUC Curve
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6, 4))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC-AUC Curve')
+plt.legend(loc='lower right')
+plt.show()
+
+print(f"ROC-AUC: {roc_auc:.4f}")
+
+# Class-wise Error Analysis
+print("\nClass-wise Error Analysis:")
+nofire_misclassified_as_fire = cm[0, 1]  # False Positives (NoFire -> Fire)
+fire_misclassified_as_nofire = cm[1, 0]  # False Negatives (Fire -> NoFire)
+print(f"NoFire misclassified as Fire: {nofire_misclassified_as_fire} ({nofire_misclassified_as_fire / len(test_nofire_labels):.2%} of NoFire class)")
+print(f"Fire misclassified as NoFire: {fire_misclassified_as_nofire} ({fire_misclassified_as_nofire / len(test_fire_labels):.2%} of Fire class)")
+
+# Fairness Metrics
+# Using error rate balance as a proxy for fairness (FPR and FNR)
+tn, fp = cm[0, 0], cm[0, 1]
+fn, tp = cm[1, 0], cm[1, 1]
+
+fpr = fp / (fp + tn) if (fp + tn) > 0 else 0  # False Positive Rate (NoFire class)
+fnr = fn / (fn + tp) if (fn + tp) > 0 else 0  # False Negative Rate (Fire class)
+
+print("\nFairness Metrics (Error Rate Balance):")
+print(f"False Positive Rate (NoFire class): {fpr:.4f}")
+print(f"False Negative Rate (Fire class): {fnr:.4f}")
+print("Note: In a fair model, FPR and FNR should be similar if classes are treated equally. If classes are unbalanced, consider rebalancing techniques.")
