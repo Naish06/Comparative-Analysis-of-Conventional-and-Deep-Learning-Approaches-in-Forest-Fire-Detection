@@ -5,7 +5,6 @@ This repository contains an comparative experimentation on **forest fire image c
 The project explores **traditional feature extraction + Random Forest** classifiers, a **novel hybrid approach**, and a **deep learning pipeline (ResNet50 + Random Forest)**.  
 The aim is to compare models in terms of accuracy, robustness, error tendencies, and fairness metrics.
 
----
 
 ## Dataset
 - Custom dataset with **6,248 images**, divided into:
